@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: RWallpprs engine
+    url: https://github.com/sysv86/rwallpprs/issues
+    about: Problems with the daemon, the SDK, video decoding or the CLI belong here.
+  - name: Niri compositor itself
+    url: https://github.com/YaLTeR/niri/issues
+    about: Compositor rendering, protocol and layer-shell bugs belong to Niri.

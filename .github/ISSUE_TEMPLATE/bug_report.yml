@@ -1,0 +1,97 @@
+name: Bug report
+description: Something in the Landroid wallpaper renders wrongly or crashes
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This wallpaper is a port of the Android 17 Easter Egg, so "the original draws it differently"
+        is a valid bug. Attach a frame dump whenever the problem is visual — that is the fastest way
+        to confirm a fix.
+
+        Before filing: search existing issues, and reproduce on the current `master`.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happens
+      description: The actual behaviour. Exact error messages, or a description of what is wrong in the picture.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: For fidelity issues, describe or link the equivalent behaviour in the Android original.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The exact command, including the seed, and the frame count for a self-test.
+      placeholder: |
+        RWALLPPRS_SELFTEST=900 RWALLPPRS_DUMP_PPM=/tmp/frame.ppm \
+            ./target/release/niri-landroid --seed 12345
+    validations:
+      required: true
+
+  - type: textarea
+    id: frame
+    attributes:
+      label: Frame dump
+      description: |
+        Attach the PPM, or a PNG conversion of it, and paste the output of
+        `python3 tools/verify_landroid_shot.py <frame.ppm>`.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: GPU model and the Vulkan/GL driver in use.
+      placeholder: AMD Radeon 780M, RADV / mesa 25.x
+    validations:
+      required: true
+
+  - type: input
+    id: niri-version
+    attributes:
+      label: Niri version
+      description: Output of `niri --version`.
+      placeholder: niri 25.x.x
+    validations:
+      required: true
+
+  - type: input
+    id: rwallpprs-version
+    attributes:
+      label: RWallpprs version
+      description: Output of `rwallpprs --version`, and the commit of the SDK the wallpaper was built against.
+      placeholder: rwallpprs 0.2.0-beta.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - animated (on the Niri desktop)
+        - standalone self-test
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: stderr from the wallpaper, plus `RWALLPPRS_STATS=1` telemetry if the issue is in the simulation.
+      render: shell
+    validations:
+      required: false

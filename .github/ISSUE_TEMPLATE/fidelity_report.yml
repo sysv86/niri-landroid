@@ -1,0 +1,47 @@
+name: Fidelity report
+description: A part of the scene does not match the Android 17 Easter Egg original
+title: "fidelity: "
+labels: ["fidelity", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form when the wallpaper renders, but differs from the Android original: wrong colour,
+        thickness, draw order, missing element, or a deviation that is not already listed in the
+        "Known deviations" section of the README.
+
+  - type: input
+    id: element
+    attributes:
+      label: Affected element
+      description: Which part of the scene, and the AOSP symbol it comes from.
+      placeholder: Star coronas (VisibleUniverse.kt drawStar / createStar)
+    validations:
+      required: true
+
+  - type: textarea
+    id: difference
+    attributes:
+      label: Difference
+      description: What the port draws, and what the original draws instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: |
+        Frame dumps, coordinates, pixel values, or the relevant upstream Kotlin code. If you found the
+        cause, point at the file and line in this repository.
+    validations:
+      required: true
+
+  - type: textarea
+    id: seed
+    attributes:
+      label: Reproducible seed and frame
+      description: A seed and a frame index where the difference is visible.
+      placeholder: --seed 12345, frame 420
+    validations:
+      required: false

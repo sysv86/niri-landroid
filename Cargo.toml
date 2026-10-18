@@ -1,0 +1,19 @@
+[package]
+name = "niri-landroid"
+version = "0.2.0-beta.1"
+edition = "2021"
+license = "MIT"
+description = "Android 17 Easter Egg \"Landroid\" wallpaper, ported to the RWallpprs wgpu scene API for the Niri compositor"
+repository = "https://github.com/sysv86/niri-landroid"
+
+[[bin]]
+name = "niri-landroid"
+path = "src/main.rs"
+
+[dependencies]
+# The wallpaper SDK, consumed straight from the RWallpprs repository.
+rwallpprs-sdk = { git = "https://github.com/sysv86/rwallpprs", branch = "main" }
+anyhow = "1.0"
+bytemuck = { version = "1.18", features = ["derive"] }
+# Needed directly: the SDK scene API hands out raw wgpu::Device/Queue/CommandEncoder types.
+wgpu = "24.0"
