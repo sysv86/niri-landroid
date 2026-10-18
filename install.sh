@@ -33,6 +33,19 @@ die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() { sed -n '3,/^$/p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true; }
 
+# A piped script shares stdin with sudo's password prompt, which would swallow the
+# rest of the script. Re-exec from a real file first, before parsing arguments, so
+# that "$@" reaches the re-executed copy intact.
+if [[ ! -t 0 && -z "${LANDROID_INSTALL_REEXEC:-}" ]]; then
+    export LANDROID_INSTALL_REEXEC=1
+    tmp="$(mktemp /tmp/niri-landroid-install.XXXXXX.sh)"
+    curl -fsSL "$SELF_URL" -o "$tmp" || die "could not download $SELF_URL"
+    if { : </dev/tty; } 2>/dev/null; then
+        exec bash "$tmp" "$@" </dev/tty
+    fi
+    exec bash "$tmp" "$@"
+fi
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --prefix)    [[ -n "${2:-}" ]] || die "--prefix needs a directory"; PREFIX="$2"; shift 2 ;;
@@ -44,18 +57,6 @@ while [[ $# -gt 0 ]]; do
         *)           die "unknown option: $1 (try --help)" ;;
     esac
 done
-
-# A piped script shares stdin with sudo's password prompt, which would swallow the
-# rest of the script. Re-exec from a real file first.
-if [[ ! -t 0 && -z "${LANDROID_INSTALL_REEXEC:-}" ]]; then
-    export LANDROID_INSTALL_REEXEC=1
-    tmp="$(mktemp /tmp/niri-landroid-install.XXXXXX.sh)"
-    curl -fsSL "$SELF_URL" -o "$tmp" || die "could not download $SELF_URL"
-    if { : </dev/tty; } 2>/dev/null; then
-        exec bash "$tmp" "$@" </dev/tty
-    fi
-    exec bash "$tmp" "$@"
-fi
 
 [[ "$(uname -s)" == "Linux" ]] || die "this wallpaper targets Linux (Niri runs on Linux only)"
 
