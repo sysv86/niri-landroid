@@ -31,7 +31,7 @@ log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '3,20p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true; }
+usage() { sed -n '3,/^$/p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -51,7 +51,7 @@ if [[ ! -t 0 && -z "${LANDROID_INSTALL_REEXEC:-}" ]]; then
     export LANDROID_INSTALL_REEXEC=1
     tmp="$(mktemp /tmp/niri-landroid-install.XXXXXX.sh)"
     curl -fsSL "$SELF_URL" -o "$tmp" || die "could not download $SELF_URL"
-    if [[ -r /dev/tty ]]; then
+    if { : </dev/tty; } 2>/dev/null; then
         exec bash "$tmp" "$@" </dev/tty
     fi
     exec bash "$tmp" "$@"
@@ -130,7 +130,7 @@ else
     SRC_DIR="$(mktemp -d /tmp/niri-landroid-src.XXXXXX)"
     CLEANUP="$SRC_DIR"
 fi
-cleanup() { [[ -n "${CLEANUP:-}" ]] && rm -rf "$CLEANUP"; }
+cleanup() { if [[ -n "${CLEANUP:-}" ]]; then rm -rf "$CLEANUP"; fi; }
 trap cleanup EXIT
 
 if [[ -z "$CLEANUP" ]]; then
