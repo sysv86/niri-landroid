@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "niri-landroid"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -700,7 +700,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rwallpprs-ipc"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 source = "git+https://github.com/sysv86/rwallpprs?branch=main#c74639029d6dcc07b5c46f4dd94dd8fb3c91235f"
 dependencies = [
  "bincode",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "rwallpprs-sdk"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 source = "git+https://github.com/sysv86/rwallpprs?branch=main#c74639029d6dcc07b5c46f4dd94dd8fb3c91235f"
 dependencies = [
  "anyhow",

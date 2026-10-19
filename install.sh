@@ -143,7 +143,13 @@ fi
 
 cd "$SRC_DIR"
 log "Building niri-landroid (the first build fetches wgpu and the RWallpprs SDK)"
-cargo build --release
+if [[ -d "$SRC_DIR/../rwallpprs-main/crates/rwallpprs-sdk" ]]; then
+    cargo build --release --config "patch.'https://github.com/sysv86/rwallpprs'.rwallpprs-sdk.path = '$SRC_DIR/../rwallpprs-main/crates/rwallpprs-sdk'" --config "patch.'https://github.com/sysv86/rwallpprs'.rwallpprs-ipc.path = '$SRC_DIR/../rwallpprs-main/crates/rwallpprs-ipc'"
+elif [[ -d "$SRC_DIR/../rwallpprs/crates/rwallpprs-sdk" ]]; then
+    cargo build --release --config "patch.'https://github.com/sysv86/rwallpprs'.rwallpprs-sdk.path = '$SRC_DIR/../rwallpprs/crates/rwallpprs-sdk'" --config "patch.'https://github.com/sysv86/rwallpprs'.rwallpprs-ipc.path = '$SRC_DIR/../rwallpprs/crates/rwallpprs-ipc'"
+else
+    cargo build --release
+fi
 
 log "Installing the wallpaper into $PREFIX/bin"
 asroot install -Dm755 target/release/niri-landroid "$PREFIX/bin/niri-landroid"
