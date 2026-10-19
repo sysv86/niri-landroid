@@ -1,29 +1,24 @@
 //! The `niri-landroid` wallpaper — a port of the Android 17 Easter Egg screensaver
-//! (DreamService) "Landroid" to a full wgpu renderer SDK.
+//! (`DreamService`) "Landroid" to the `rwallpprs-sdk` `wgpu` scene API.
 //!
-//! The UI and gameplay are NOT ported: an endless observation of the Landroid ship,
-//! which flies around the universe on autopilot.
+//! Renders an endless observation of the Landroid ship flying across a procedural
+//! solar system on autopilot, with smooth Niri tiling strip parallax and Overview zoom.
 //!
 //! ## Standalone / self-test
-//! If there is no `RWALLPPRS_SHM_FD` (or `RWALLPPRS_SELFTEST=N` is set), `main` runs
-//! N simulation frames with `dt = 1/60`, calling `render_scene` through the SDK adapter,
-//! and (with `RWALLPPRS_DUMP_PPM`) saves the last frame to a PPM for checking.
+//! If `RWALLPPRS_SHM_FD` is absent (or `RWALLPPRS_SELFTEST=N` is set), `main` runs
+//! `N` simulation frames with `dt = 1/60` through `SceneWallpaperAdapter` and (when
+//! `RWALLPPRS_DUMP_PPM` is set) saves the final frame to a binary `P6` PPM image.
 //!
 //! Environment variables / arguments:
 //! * `--seed N` (or `--seed=N`) — universe seed; takes priority over `RWALLPPRS_SEED`,
-//!   which in turn takes priority over dailySeed (year*10000+month*100+day in UTC);
-//! * `RWALLPPRS_SELFTEST=N` — run N frames without SHM and exit;
-//! * `RWALLPPRS_DUMP_PPM=<path>` — save the last self-test frame to a PPM (P6);
-//! * `RWALLPPRS_STATS=1` — print telemetry (position, zoom, instance count) to stderr;
-//! * `RWALLPPRS_DEBUG_SHIP_R=<r>` — place the ship at distance `r` from the center
-//!   of the universe (diagnostics: the ringfence is almost always outside the frame in normal flight).
-//!
-//! Note: instead of the `run_scene_wallpaper!` macro, a custom `main` is written here,
-//! because the SDK's regular standalone path draws exactly one frame, while we need a
-//! multi-frame self-test (the same `SceneWallpaperAdapter` and `run_wallpaper_loop`
-//! are used for the daemon's production mode).
+//!   which takes priority over `dailySeed` (`year*10000 + month*100 + day` in UTC).
+//! * `RWALLPPRS_SELFTEST=N` — run `N` frames without SHM and exit.
+//! * `RWALLPPRS_DUMP_PPM=<path>` — save the final self-test frame to a PPM (`P6`).
+//! * `RWALLPPRS_STATS=1` — print per-second telemetry (position, zoom, instance count) to stderr.
+//! * `RWALLPPRS_DEBUG_SHIP_R=<r>` — place the ship at distance `r` from the universe center
+//!   for `Container` (ringfence) pixel verification.
 
-#[allow(dead_code)] // assets.rs is generated and contains constants, some of which are unused
+#[allow(dead_code)]
 mod assets;
 mod render;
 mod sim;
@@ -36,7 +31,6 @@ use rwallpprs_sdk::{
 use render::Renderer;
 use sim::{Simulator, Vec2};
 
-/// From MainActivity.kt.
 const DEFAULT_CAMERA_ZOOM: f32 = 1.0;
 const MIN_CAMERA_ZOOM: f32 = 250.0 / sim::UNIVERSE_RANGE;
 const MAX_CAMERA_ZOOM: f32 = 5.0;
@@ -45,13 +39,14 @@ pub struct LandroidWallpaper {
     universe: Simulator,
     renderer: Renderer,
     camera_zoom: f32,
-    /// `RWALLPPRS_STATS=1` — print per-frame telemetry to stderr (diagnostics).
+    smooth_scroll_x: f32,
+    overview_factor: f32,
     stats: bool,
 }
 
 impl LandroidWallpaper {
-    /// Seed priority: the `--seed N` argument (or `--seed=N`) -> the environment variable
-    /// `RWALLPPRS_SEED` -> dailySeed = year*10000 + month*100 + day (today in UTC).
+    /// Resolves the universe seed in priority order:
+    /// `--seed N` CLI flag -> `RWALLPPRS_SEED` env var -> UTC `dailySeed` (`YYYYMMDD`).
     fn resolve_seed(args: &[String]) -> i64 {
         let mut i = 0;
         while i < args.len() {
@@ -83,13 +78,9 @@ impl LandroidWallpaper {
         y * 10_000 + m * 100 + d
     }
 
-    /// One simulation step per frame.
-    ///
-    /// Normal frame: a single step with the real `dt` (as in the original, which skips
-    /// `dt > MAX_VALID_DT`). An abnormally large `dt` (the machine slept, the tab was
-    /// frozen) is split into fixed 1/60 steps with an overall cap of
-    /// `MAX_VALID_DT` — with no catch-up to real time.
-    fn advance(&mut self, dt_raw: f32) {
+    /// Steps the physics simulation and updates camera zoom + Niri parallax smoothing.
+    fn advance(&mut self, ctx: &FrameContext) {
+        let dt_raw = ctx.dt_secs;
         let dt = dt_raw.clamp(0.0, sim::MAX_VALID_DT);
         if dt_raw > sim::MAX_VALID_DT {
             const FIXED_DT: f32 = 1.0 / 60.0;
@@ -102,17 +93,40 @@ impl LandroidWallpaper {
         } else {
             self.universe.step(dt);
         }
-        self.update_camera(dt);
+        self.update_camera(dt, &ctx.niri);
     }
 
-    /// Camera zoom from MainActivity.kt (DYNAMIC_ZOOM = true, as in DreamUniverse).
-    fn update_camera(&mut self, dt: f32) {
+    /// Updates dynamic camera zoom (`MainActivity.kt` `DYNAMIC_ZOOM = true`) and smooth Niri
+    /// strip parallax when compositor events are present.
+    fn update_camera(&mut self, dt: f32, niri: &NiriViewportState) {
         let ci = self.universe.closest_body_index();
         let (pos, radius) = self.universe.body_pos_radius(ci);
         let dist_to_surface =
             ((self.universe.ship.body.pos - pos).mag() - radius * 1.2).max(0.0);
         let target_zoom = (500.0 / dist_to_surface).clamp(MIN_CAMERA_ZOOM, MAX_CAMERA_ZOOM);
         self.camera_zoom = sim::exp_smooth(self.camera_zoom, target_zoom, dt, 1.5);
+
+        let target_scroll = niri.strip_scroll_offset as f32;
+        self.smooth_scroll_x = sim::exp_smooth(self.smooth_scroll_x, target_scroll, dt, 6.0);
+
+        let target_overview = if niri.overview_open { 1.0 } else { 0.0 };
+        self.overview_factor = sim::exp_smooth(self.overview_factor, target_overview, dt, 5.0);
+    }
+
+    #[inline]
+    fn effective_zoom(&self) -> f32 {
+        let overview_scale = 1.0 - self.overview_factor * 0.15;
+        (self.camera_zoom * overview_scale).clamp(MIN_CAMERA_ZOOM, MAX_CAMERA_ZOOM)
+    }
+
+    #[inline]
+    fn parallax_world_offset(&self, zoom: f32) -> Vec2 {
+        if self.smooth_scroll_x.abs() < 1e-3 {
+            Vec2::ZERO
+        } else {
+            let z = zoom.max(1e-6);
+            Vec2::new(-self.smooth_scroll_x * 0.12 / z, 0.0)
+        }
     }
 
     fn print_stats(&self, frame_index: u64) {
@@ -148,13 +162,8 @@ impl GpuSceneWallpaper for LandroidWallpaper {
         let seed = Self::resolve_seed(args);
         let mut universe = Simulator::new(seed);
         universe.init_random();
-        // DreamUniverse.onAttachedToWindow: the autopilot is created and enabled in screensaver mode.
         universe.autopilot.enabled = true;
 
-        // Self-test diagnostics: `RWALLPPRS_DEBUG_SHIP_R=r` places the ship at distance
-        // `r` from the center of the universe. Needed to pixel-check the rendering of the
-        // ringfence (Container): in normal flight it is almost always outside the frame,
-        // because the autopilot stays inside the planetary orbits and the camera follows the ship.
         if let Ok(v) = std::env::var("RWALLPPRS_DEBUG_SHIP_R") {
             if let Ok(r) = v.trim().parse::<f32>() {
                 let a = 0.9f32;
@@ -168,14 +177,22 @@ impl GpuSceneWallpaper for LandroidWallpaper {
             universe,
             renderer: Renderer::new(),
             camera_zoom: DEFAULT_CAMERA_ZOOM,
+            smooth_scroll_x: 0.0,
+            overview_factor: 0.0,
             stats: std::env::var("RWALLPPRS_STATS").is_ok(),
         }
     }
 
-    fn render_scene(&mut self, ctx: &FrameContext, scene: &mut GpuScene<'_>) -> bool {
-        self.advance(ctx.dt_secs);
+    fn on_suspend(&mut self) {}
 
-        self.renderer.draw(scene, &self.universe, self.camera_zoom);
+    fn on_resume(&mut self) {}
+
+    fn render_scene(&mut self, ctx: &FrameContext, scene: &mut GpuScene<'_>) -> bool {
+        self.advance(ctx);
+
+        let zoom = self.effective_zoom();
+        let parallax = self.parallax_world_offset(zoom);
+        self.renderer.draw(scene, &self.universe, zoom, parallax);
 
         if self.stats && ctx.frame_index % 60 == 0 {
             self.print_stats(ctx.frame_index);
@@ -184,14 +201,18 @@ impl GpuSceneWallpaper for LandroidWallpaper {
     }
 
     fn fallback_cpu_render(&mut self, ctx: &FrameContext, canvas: &mut Canvas<'_>) {
-        self.advance(ctx.dt_secs);
+        self.advance(ctx);
 
-        let zoom = self.camera_zoom.max(1e-6);
-        let ship = self.universe.ship.body.pos;
+        let zoom = self.effective_zoom().max(1e-6);
+        let parallax = self.parallax_world_offset(zoom);
+        let ship = self.universe.ship.body.pos - parallax;
         let w = ctx.width as f32;
         let h = ctx.height as f32;
         let project = |p: Vec2| -> (f32, f32) {
-            ((p.x - ship.x) * zoom + w * 0.5, (p.y - ship.y) * zoom + h * 0.5)
+            (
+                (p.x - ship.x) * zoom + w * 0.5,
+                (p.y - ship.y) * zoom + h * 0.5,
+            )
         };
 
         canvas.clear(Color::from_hex(0x16161D));
@@ -204,11 +225,15 @@ impl GpuSceneWallpaper for LandroidWallpaper {
         for p in &self.universe.planets {
             let (px, py) = project(p.body.pos);
             let pr = (p.body.radius * zoom).max(1.0);
-            let c = if p.explored { to_color(p.color) } else { Color::from_hex(0xA7A7CA) };
+            let c = if p.explored {
+                to_color(p.color)
+            } else {
+                Color::from_hex(0xA7A7CA)
+            };
             canvas.fill_circle_sdf(px, py, pr, c);
         }
 
-        let (shx, shy) = project(ship);
+        let (shx, shy) = project(self.universe.ship.body.pos);
         canvas.fill_circle_sdf(shx, shy, 2.5, Color::rgb(0xFF, 0xFF, 0xFF));
         let pos = &self.universe.ship.track.positions;
         let n = pos.len();
@@ -230,7 +255,7 @@ fn to_color(c: [f32; 4]) -> Color {
     Color::rgb(b(c[0]), b(c[1]), b(c[2]))
 }
 
-/// Days from the epoch -> (year, month, day) in the proleptic Gregorian calendar.
+/// Converts days since the Unix epoch into `(year, month, day)` in the proleptic Gregorian calendar.
 fn civil_from_days(z0: i64) -> (i64, i64, i64) {
     let z = z0 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -265,14 +290,11 @@ fn main() -> anyhow::Result<()> {
         .and_then(|v| v.trim().parse().ok());
 
     if has_shm && selftest.is_none() {
-        // Production mode: the daemon passes the SHM fd and events over stdin.
         return rwallpprs_sdk::run_wallpaper_loop::<SceneWallpaperAdapter<LandroidWallpaper>>();
     }
 
-    // Standalone (or an explicit self-test): run N frames so the scene has time to come alive.
     let frames = selftest.unwrap_or(900);
     let dump_path = std::env::var("RWALLPPRS_DUMP_PPM").ok();
-    // Do not make the adapter write a PPM on every frame — we only save the last one.
     std::env::remove_var("RWALLPPRS_DUMP_PPM");
 
     let width = 1920u32;
@@ -280,8 +302,7 @@ fn main() -> anyhow::Result<()> {
     let mut buffer = vec![0u32; (width * height) as usize];
     let mut canvas = Canvas::from_raw_slice(width, height, &mut buffer);
 
-    let mut wallpaper =
-        <SceneWallpaperAdapter<LandroidWallpaper> as Wallpaper>::init(&args);
+    let mut wallpaper = <SceneWallpaperAdapter<LandroidWallpaper> as Wallpaper>::init(&args);
 
     for i in 0..frames {
         let ctx = FrameContext {
