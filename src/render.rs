@@ -1,26 +1,13 @@
-//! Full wgpu render of the "Landroid" screensaver (canon: VisibleUniverse.kt +
-//! the `Spaaaaace` draw loop from MainActivity.kt).
+//! Full `wgpu` renderer for the "Landroid" screensaver (canonical reference: `VisibleUniverse.kt` +
+//! the `Spaaaaace` draw loop from `MainActivity.kt`).
 //!
-//! Two pipelines are used:
-//! * `shapes` — instanced SDF pipeline (segments / filled circles / stroked circles),
-//!   one instance = one primitive shape; 4×vec4 attributes per instance;
-//! * `fill` — CPU-triangulated polygons (the ship silhouette), a static index
-//!   buffer + a dynamic vertex buffer (world coordinates are recomputed on the CPU).
+//! Uses two GPU pipelines:
+//! * `shapes` — instanced SDF pipeline (line segments, filled circles, stroked circles, dashed rings),
+//!   where one instance represents one geometric primitive (`4 * vec4<f32>` = 64 bytes per instance).
+//! * `fill` — CPU-triangulated polygon pipeline (the ship body silhouette), backed by a pre-populated
+//!   static index buffer and a dynamic vertex buffer transformed into world coordinates each frame.
 //!
-//! All colors are given as sRGB bytes / 255 and written directly (no gamma conversion),
-//! as the `Bgra8Unorm` target texture requires.
-//!
-//! ## Known deviations from the original
-//! * `PathEffect.cornerPathEffect(radius = 200f)` on the star crowns is not reproduced —
-//!   the crowns are drawn as a polyline without corner rounding (the corners of the
-//!   37-ray star are obtuse, and the rounding radius is only ~17 "world" units per ray).
-//! * Grid step: the original uses `32.dp.toPx()`, here it is 32 screen px (on desktop dp ≈ px).
-//! * The ship silhouette fill is a CPU triangulation (ear clipping) without edge
-//!   antialiasing; Compose draws it with AA.
-//! * `Container` is drawn with the `Colors` canon color `Color(0xFF800000)` — that is ARGB
-//!   with alpha = 0xFF (an opaque #800000), not "alpha = 0.5".
-//! * `STAR_POINTS`: the canon `Build.VERSION.SDK_INT.takeIf { it in 1..99 } ?: 31` yields
-//!   37 for Android 17 (API 37), so the crowns have 37 and 38 rays.
+//! All colors are specified in sRGB (`0..1`) and written directly to the `Bgra8Unorm` target texture.
 
 use bytemuck::{Pod, Zeroable};
 use rwallpprs_sdk::GpuScene;
@@ -31,24 +18,22 @@ use crate::sim::{self, Simulator, Vec2, PI2f};
 const KIND_LINE: f32 = 0.0;
 const KIND_CIRCLE_FILL: f32 = 1.0;
 const KIND_CIRCLE_STROKE: f32 = 2.0;
-/// Dashed stroked circle in SCREEN pixels (Container/ringfence):
-/// `a3.w` is the pattern period in px (dash = gap = period/2), like
-/// `PathEffect.dashPathEffect([8/zoom, 8/zoom])` (see VisibleUniverse.kt:drawContainer).
+/// Dashed stroked circle in screen pixels (`Container` / ringfence):
+/// `a3.w` holds the dash+gap period in pixels (`PathEffect.dashPathEffect([8/zoom, 8/zoom])`).
 const KIND_DASHED_CIRCLE: f32 = 3.0;
 
-/// VisibleUniverse.kt: `val STAR_POINTS = Build.VERSION.SDK_INT.takeIf { it in 1..99 } ?: 31`.
-/// On a real device this is always the API level itself (the 31 fallback only applies to
-/// dev builds with SDK_INT = 10000). Android 17 = API 37, so the star crowns have
-/// 37 and 38 rays (the task spec said 31/32 — that is the fallback branch).
+/// `VisibleUniverse.kt`: `val STAR_POINTS = Build.VERSION.SDK_INT.takeIf { it in 1..99 } ?: 31`.
+/// Android 17 = API 37, so the two star coronas have 37 and 38 rays.
 const STAR_POINTS: u32 = 37;
 
-/// drawContainer: `PathEffect.dashPathEffect(floatArrayOf(8f / zoom, 8f / zoom), 0f)` —
-/// dash 8 screen px, gap 8 screen px.
+/// `drawContainer`: `PathEffect.dashPathEffect(floatArrayOf(8f / zoom, 8f / zoom), 0f)` —
+/// 8 screen px dash, 8 screen px gap.
 const CONTAINER_DASH_PX: f32 = 8.0;
-/// drawContainer: color `Color(0xFF800000)`. In Compose that is ARGB with alpha = 0xFF, i.e.
-/// an OPAQUE dark red #800000 (the task description calls it "alpha = 0.5", but
-/// 0x80 there is the red channel, not alpha; see README: known deviations).
+/// `drawContainer`: `Color(0xFF800000)` (opaque dark red `#800000`).
 const CONTAINER_RGB: [f32; 4] = [0x80 as f32 / 255.0, 0.0, 0.0, 1.0];
+
+/// Initial GPU instance buffer capacity (8,192 instances = 512 KB VRAM, dynamically grown on demand).
+const INIT_INST_CAPACITY: usize = 8_192;
 
 // ---------------------------------------------------------------------------
 // GPU structures
@@ -65,11 +50,11 @@ struct FrameUniform {
     _p2: f32,
 }
 
-/// One instance of a shape.
-/// a0 = {p0.xy, p1.xy}
-/// a1 = {width_or_radius, kind, alpha, clip_radius}
-/// a2 = color rgba
-/// a3 = {clip_center.xy, thickness, dash_period_px}
+/// One primitive shape instance (64 bytes):
+/// - `a0` = `{p0.xy, p1.xy}`
+/// - `a1` = `{width_or_radius, kind, alpha, clip_radius}`
+/// - `a2` = `color rgba`
+/// - `a3` = `{clip_center.xy, thickness, dash_period_px}`
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Instance {
@@ -97,7 +82,7 @@ fn with_alpha(c: [f32; 4], a: f32) -> [f32; 4] {
 }
 
 // ---------------------------------------------------------------------------
-// WGSL
+// WGSL shaders
 // ---------------------------------------------------------------------------
 const SHAPES_WGSL: &str = r#"
 struct Frame {
@@ -199,7 +184,7 @@ fn seg_dist(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let kind = i32(in.prm.y + 0.5);
 
-    // clip circle (planet textures) in world coordinates
+    // Optional circular clip region in world coordinates (used for planet surface textures)
     if (in.prm.w > 0.0) {
         if (length(in.world - in.ext.xy) > in.prm.w) {
             discard;
@@ -227,15 +212,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         cov = clamp((half - d) / aa + 0.5, 0.0, 1.0);
     }
 
-    // Container dashes: a fixed-length "dash/gap" pattern in screen px.
-    // Arc length in px = angle * radius * zoom (phase 0 starts at angle 0,
-    // as in PathEffect.dashPathEffect(phase = 0)).
+    // Container dashes: fixed-length dash/gap pattern in screen pixels.
     if (kind == 3) {
         let rel = in.world - in.p0;
         let per = max(in.ext.w, 1.0);
         let arc = atan2(rel.y, rel.x) * in.prm.x * fr.zoom;
         let x = fract(arc / per);
-        let sd = min(x, 0.5 - x) * per; // px inside the dash (>0) / gap (<0)
+        let sd = min(x, 0.5 - x) * per;
         cov = cov * clamp(sd + 0.5, 0.0, 1.0);
     }
 
@@ -291,7 +274,7 @@ fn fs_main(in: FOut) -> @location(0) vec4<f32> {
 "#;
 
 // ---------------------------------------------------------------------------
-// Instance emission
+// Instance emission helpers
 // ---------------------------------------------------------------------------
 #[inline]
 fn push_line(
@@ -350,8 +333,6 @@ fn push_circle_stroke(
     });
 }
 
-/// Dashed circle (Container): `dash_period_px` is the period of the dash pattern
-/// in screen pixels (dash = gap = period/2), independent of zoom.
 #[inline]
 fn push_dashed_circle(
     out: &mut Vec<Instance>,
@@ -373,11 +354,7 @@ fn push_dashed_circle(
     });
 }
 
-/// The visible (in world units) region of the frame, with a 10 % margin — used to cull
-/// invisible objects, sparks and track segments.
-///
-/// All the tests are conservative: an object is discarded only if it definitely does not
-/// intersect a single pixel of the frame, so culling never changes the picture.
+/// Conservative world-space view frustum with a 10% safety margin for culling off-screen primitives.
 #[derive(Clone, Copy)]
 struct View {
     min: Vec2,
@@ -387,7 +364,6 @@ struct View {
 }
 
 impl View {
-    /// `cam` — cameraOffset from MainActivity (world meters "from the ship toward (0,0)").
     fn new(cam: Vec2, zoom: f32, width: u32, height: u32) -> Self {
         let z = zoom.max(1e-9);
         let hw = width as f32 * 0.5 / z;
@@ -402,20 +378,16 @@ impl View {
         }
     }
 
-    /// A filled disk of radius `r` centered at `c` intersects the frame.
     #[inline]
     fn disk_visible(&self, c: Vec2, r: f32) -> bool {
         (c - self.center).mag() <= r + self.half_diag
     }
 
-    /// A thin circle of radius `r` centered at `c` intersects the frame.
-    /// (The circle passes at distance `|d - r|` from the frame center.)
     #[inline]
     fn circle_visible(&self, c: Vec2, r: f32) -> bool {
         ((c - self.center).mag() - r).abs() <= self.half_diag
     }
 
-    /// Point `p` inside the frame with an extra margin `pad` (in world units).
     #[inline]
     fn point_visible(&self, p: Vec2, pad: f32) -> bool {
         p.x >= self.min.x - pad
@@ -424,7 +396,6 @@ impl View {
             && p.y <= self.max.y + pad
     }
 
-    /// Conservative: the bbox of the segment `a..b`, expanded by `pad`, intersects the frame.
     #[inline]
     fn seg_visible(&self, a: Vec2, b: Vec2, pad: f32) -> bool {
         let x0 = a.x.min(b.x);
@@ -469,7 +440,7 @@ fn push_polyline(
 }
 
 // ---------------------------------------------------------------------------
-// GPU context
+// GPU pipeline & buffers
 // ---------------------------------------------------------------------------
 struct Gpu {
     shapes_pipeline: wgpu::RenderPipeline,
@@ -637,15 +608,14 @@ impl Gpu {
             cache: None,
         });
 
-        const INIT_INST: usize = 300_000;
         let inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("landroid-instances"),
-            size: (INIT_INST * std::mem::size_of::<Instance>()) as u64,
+            size: (INIT_INST_CAPACITY * std::mem::size_of::<Instance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let fill_vcapacity = 4096usize;
+        let fill_vcapacity = 256usize;
         let fill_vbuffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("landroid-fill-vertices"),
             size: (fill_vcapacity * std::mem::size_of::<FillVertex>()) as u64,
@@ -653,12 +623,21 @@ impl Gpu {
             mapped_at_creation: false,
         });
 
+        // Populate the static triangulation index buffer at creation time so the ship
+        // silhouette interior fill (`draw_indexed`) renders properly over the landing legs.
+        let index_bytes: &[u8] = bytemuck::cast_slice(indices);
+        let index_buf_size = (index_bytes.len().max(4) + 3) & !3;
         let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("landroid-fill-indices"),
-            size: (indices.len().max(1) * std::mem::size_of::<u32>()) as u64,
+            size: index_buf_size as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+            mapped_at_creation: !index_bytes.is_empty(),
         });
+        if !index_bytes.is_empty() {
+            index_buffer.slice(..index_bytes.len() as u64).get_mapped_range_mut()[..index_bytes.len()]
+                .copy_from_slice(index_bytes);
+            index_buffer.unmap();
+        }
 
         Self {
             shapes_pipeline,
@@ -666,7 +645,7 @@ impl Gpu {
             bind_group,
             frame_buffer,
             inst_buffer,
-            inst_capacity: INIT_INST,
+            inst_capacity: INIT_INST_CAPACITY,
             fill_vbuffer,
             fill_vcapacity,
             index_buffer,
@@ -704,7 +683,7 @@ impl Gpu {
 }
 
 // ---------------------------------------------------------------------------
-// Triangulation (ear clipping)
+// Polygon ear-clipping triangulation
 // ---------------------------------------------------------------------------
 fn cross2(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
     (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
@@ -719,7 +698,7 @@ fn point_in_tri(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> b
     !(has_neg && has_pos)
 }
 
-/// Simple and correct ear-clipping triangulation of a closed polygon.
+/// Ear-clipping triangulation of a simple closed polygon.
 fn triangulate(poly: &[(f32, f32)]) -> Vec<u32> {
     let n = poly.len();
     if n < 3 {
@@ -750,7 +729,7 @@ fn triangulate(poly: &[(f32, f32)]) -> Vec<u32> {
             let b = poly[ic];
             let c = poly[inx];
             if cross2(a, b, c) <= 0.0 {
-                continue; // not a convex vertex
+                continue;
             }
             let mut contains = false;
             for &k in &idx {
@@ -784,36 +763,26 @@ fn triangulate(poly: &[(f32, f32)]) -> Vec<u32> {
     tris
 }
 
-fn star_points(radius1: f32, radius2: f32, points: u32) -> Vec<Vec2> {
+fn fill_star_points(out: &mut Vec<Vec2>, radius1: f32, radius2: f32, points: u32) {
+    out.clear();
     let angle_step = PI2f / points as f32;
-    let mut v = Vec::with_capacity((points as usize) * 2);
-    v.push(Vec2::new(radius1, 0.0));
-    v.push(Vec2::new(
+    out.reserve((points as usize) * 2);
+    out.push(Vec2::new(radius1, 0.0));
+    out.push(Vec2::new(
         radius2 * (angle_step * 0.5).cos(),
         radius2 * (angle_step * 0.5).sin(),
     ));
     for i in 1..points {
         let i_f = i as f32;
-        v.push(Vec2::new(
+        out.push(Vec2::new(
             radius1 * (angle_step * i_f).cos(),
             radius1 * (angle_step * i_f).sin(),
         ));
-        v.push(Vec2::new(
+        out.push(Vec2::new(
             radius2 * (angle_step * (i_f + 0.5)).cos(),
             radius2 * (angle_step * (i_f + 0.5)).sin(),
         ));
     }
-    v
-}
-
-fn polygon_points(radius: f32, sides: u32) -> Vec<Vec2> {
-    let angle_step = PI2f / sides as f32;
-    (0..sides)
-        .map(|i| {
-            let a = angle_step * i as f32;
-            Vec2::new(radius * a.cos(), radius * a.sin())
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -824,9 +793,17 @@ pub struct Renderer {
     instances: Vec<Instance>,
     fill_verts: Vec<FillVertex>,
     fill_indices: Vec<u32>,
-    /// The visible region of the current frame (used for culling).
+    /// Reusable scratch buffer for transformed polylines (eliminates per-frame heap allocations).
+    scratch_pts: Vec<Vec2>,
+    /// Reusable scratch buffer for base star corona vertices.
+    star_base_pts: Vec<Vec2>,
+    /// Precomputed unit 15-gon vertices for the autopilot braking ring.
+    unit_poly_15: [Vec2; 15],
+    /// Reusable planet draw order indices.
+    planet_order: Vec<usize>,
+    /// Visible world-space frustum for the current frame.
     view: View,
-    /// Number of instances in the last drawn frame (for measurements/diagnostics).
+    /// Instance count of the last rendered frame.
     last_instances: usize,
 }
 
@@ -842,66 +819,83 @@ impl Renderer {
             .first()
             .map(|p| triangulate(p))
             .unwrap_or_default();
+
+        let mut unit_poly_15 = [Vec2::ZERO; 15];
+        let step = PI2f / 15.0;
+        for (i, slot) in unit_poly_15.iter_mut().enumerate() {
+            let a = step * (i as f32);
+            *slot = Vec2::new(a.cos(), a.sin());
+        }
+
         Self {
             gpu: None,
-            instances: Vec::new(),
-            fill_verts: Vec::new(),
+            instances: Vec::with_capacity(INIT_INST_CAPACITY),
+            fill_verts: Vec::with_capacity(192),
             fill_indices,
+            scratch_pts: Vec::with_capacity(192),
+            star_base_pts: Vec::with_capacity(80),
+            unit_poly_15,
+            planet_order: Vec::with_capacity(16),
             view: View::new(Vec2::ZERO, 1.0, 1, 1),
             last_instances: 0,
         }
     }
 
-    /// Number of shape instances in the last frame (performance measurement/diagnostics).
     pub fn last_instance_count(&self) -> usize {
         self.last_instances
     }
 
-    pub fn draw(&mut self, scene: &mut GpuScene<'_>, u: &Simulator, zoom: f32) {
+    pub fn draw(
+        &mut self,
+        scene: &mut GpuScene<'_>,
+        u: &Simulator,
+        zoom: f32,
+        parallax_offset: Vec2,
+    ) {
         if self.gpu.is_none() {
             self.gpu = Some(Gpu::new(scene.device, scene.format, &self.fill_indices));
         }
 
         let now = u.now;
         let ship_pos = u.ship.body.pos;
-        let cam = ship_pos * -1.0;
+        let cam = ship_pos * -1.0 + parallax_offset;
         self.view = View::new(cam, zoom, scene.width, scene.height);
 
         self.instances.clear();
         self.fill_verts.clear();
 
-        // 1. Grid (drawn first, beneath everything else — like drawRect + grid
-        //    before drawUniverse in MainActivity.Spaaaaace).
+        // 1. Background coordinate grid
         self.emit_grid(zoom, cam, scene.width, scene.height);
 
-        // 2. constraints: the landing flag (Landing), then the Container (ringfence).
+        // 2. Constraints: landing flag, then Container (ringfence)
         self.emit_landing_flag(u, zoom);
         self.emit_container(u, zoom);
 
-        // 3. Star (drawStar: gravitational fields + fill + 2 crowns).
+        // 3. Star (gravitational field + disk + 2 rotating coronas)
         self.emit_star(u, now, zoom);
 
-        // 4. entities: planets (in creation order, as in ArraySet) and sparks.
-        let mut order: Vec<usize> = (0..u.planets.len()).collect();
-        order.sort_by_key(|&i| u.planets[i].spawn_order);
-        for i in order {
-            self.emit_planet(&u.planets[i], u, now, zoom);
+        // 4. Entities: planets (in spawn order) and sparks
+        self.planet_order.clear();
+        self.planet_order.extend(0..u.planets.len());
+        self.planet_order.sort_by_key(|&i| u.planets[i].spawn_order);
+        for idx in 0..self.planet_order.len() {
+            let pi = self.planet_order[idx];
+            self.emit_planet(&u.planets[pi], u, now, zoom);
         }
         for s in &u.sparks {
             self.emit_spark(s, zoom);
         }
 
-        // 5. Autopilot.
+        // 5. Autopilot overlay
         self.emit_autopilot(u, now, zoom);
 
-        // 6. Ship: legs -> fill -> outline -> exhaust, and ONLY AFTER that
-        //    the track (drawTrack is called inside drawSpacecraft after the ship).
+        // 6. Ship: legs -> interior fill -> outline -> thrust -> flight track
         let fill_split = self.emit_ship(u, zoom);
         self.emit_track(u, zoom);
         let total = self.instances.len();
         self.last_instances = total;
 
-        // ---- buffer upload ----
+        // ---- Upload GPU buffers ----
         let gpu = self.gpu.as_mut().unwrap();
         gpu.ensure_instances(scene.device, total.max(1));
         gpu.ensure_fill_vertices(scene.device, self.fill_verts.len().max(1));
@@ -952,15 +946,14 @@ impl Renderer {
 
         let idx_ok = gpu.index_count >= 3 && !self.fill_verts.is_empty();
 
-        // 7a. everything drawn before the ship silhouette fill
-        //     (grid, flag, Container, star, planets, sparks, autopilot, legs)
+        // 7a. Pre-fill shapes (grid, flag, Container, star, planets, sparks, autopilot, legs)
         if fill_split > 0 {
             pass.set_pipeline(&gpu.shapes_pipeline);
             pass.set_vertex_buffer(0, gpu.inst_buffer.slice(..));
             pass.draw(0..6, 0..fill_split as u32);
         }
 
-        // 7b. ship polygon fill (Colors.Eigengrau, drawn "over" the legs)
+        // 7b. Ship polygon fill (Colors.Eigengrau, drawn over the landing legs)
         if idx_ok {
             pass.set_pipeline(&gpu.fill_pipeline);
             pass.set_vertex_buffer(0, gpu.fill_vbuffer.slice(..));
@@ -968,7 +961,7 @@ impl Renderer {
             pass.draw_indexed(0..gpu.index_count, 0, 0..1);
         }
 
-        // 7c. ship outline -> exhaust -> track
+        // 7c. Post-fill shapes (ship outline -> exhaust -> track)
         if total > fill_split {
             pass.set_pipeline(&gpu.shapes_pipeline);
             pass.set_vertex_buffer(0, gpu.inst_buffer.slice(..));
@@ -1039,8 +1032,6 @@ impl Renderer {
             let force = sim::lerp(2000.0, 0.01, (i as f32 - now % 1.0) / rings as f32);
             let r = (sim::GRAVITATION * mass * sim::SPACECRAFT_MASS / force.max(1e-6)).sqrt();
             let alpha = sim::lerp(0.75, 0.1, i as f32 / rings as f32);
-            // The rings can be enormous (r up to ~3e6) — discard only those that
-            // definitely do not intersect the frame.
             if !view.circle_visible(pos, r) {
                 continue;
             }
@@ -1057,9 +1048,6 @@ impl Renderer {
         }
     }
 
-    /// Container/ringfence: a dashed circle of radius UNIVERSE_RANGE around (0,0),
-    /// color `Color(0xFF800000)`, thickness 1/zoom, dash/gap of 8 screen px each
-    /// (VisibleUniverse.kt:drawContainer).
     fn emit_container(&mut self, u: &Simulator, zoom: f32) {
         let r = u.ringfence_radius;
         if !self.view.circle_visible(Vec2::ZERO, r) {
@@ -1081,25 +1069,23 @@ impl Renderer {
         let pos = star.body.pos;
         let r = star.body.radius;
 
-        // the star's gravitational field (drawStar -> drawGravitationalField)
         self.emit_grav_field(pos, star.body.mass, now, zoom);
 
-        // The star disk and both crowns lie within radius r + 250 — if this disk
-        // does not intersect the frame, there is nothing to draw.
         if !self.view.disk_visible(pos, r + 250.0) {
             return;
         }
 
         push_circle_fill(&mut self.instances, pos, r, star.color, 1.0);
 
-        // two crowns (createStar). cornerPathEffect(radius = 200) is not reproduced
-        // in the shader renderer (see README: known deviations).
-        let crown1 = star_points(r + 80.0, r + 250.0, STAR_POINTS);
+        fill_star_points(&mut self.star_base_pts, r + 80.0, r + 250.0, STAR_POINTS);
         let rot1 = star.anim / 23.0 * PI2f;
-        let pts1: Vec<Vec2> = crown1.iter().map(|p| pos + p.rotate(rot1)).collect();
+        self.scratch_pts.clear();
+        for &p in &self.star_base_pts {
+            self.scratch_pts.push(pos + p.rotate(rot1));
+        }
         push_polyline(
             &mut self.instances,
-            &pts1,
+            &self.scratch_pts,
             true,
             3.0 / zoom,
             star.color,
@@ -1108,12 +1094,20 @@ impl Renderer {
             0.0,
         );
 
-        let crown2 = star_points(r + 20.0, r + 200.0, STAR_POINTS + 1);
+        fill_star_points(
+            &mut self.star_base_pts,
+            r + 20.0,
+            r + 200.0,
+            STAR_POINTS + 1,
+        );
         let rot2 = star.anim / -19.0 * PI2f;
-        let pts2: Vec<Vec2> = crown2.iter().map(|p| pos + p.rotate(rot2)).collect();
+        self.scratch_pts.clear();
+        for &p in &self.star_base_pts {
+            self.scratch_pts.push(pos + p.rotate(rot2));
+        }
         push_polyline(
             &mut self.instances,
-            &pts2,
+            &self.scratch_pts,
             true,
             3.0 / zoom,
             star.color,
@@ -1151,13 +1145,15 @@ impl Renderer {
             return;
         }
 
-        push_circle_fill(&mut self.instances, p.body.pos, p.body.radius, c4(assets::EIGENGRAU), 1.0);
+        push_circle_fill(
+            &mut self.instances,
+            p.body.pos,
+            p.body.radius,
+            c4(assets::EIGENGRAU),
+            1.0,
+        );
 
-        // texture (only after exploration and when near the ship)
-        if p.explored
-            && zoom > 0.05
-            && p.body.pos.distance(u.ship.body.pos) < 10_000.0
-        {
+        if p.explored && zoom > 0.05 && p.body.pos.distance(u.ship.body.pos) < 10_000.0 {
             self.emit_planet_texture(p, draw_color, zoom);
         }
 
@@ -1181,8 +1177,6 @@ impl Renderer {
         let tex = assets::PLANET_TEXTURES[tex_idx];
         let scale = radius / (assets::PLANET_TEXTURE_SIZE / 2.0);
         let rot = PI2f * (radius % 100.0) / 100.0;
-        // As in the original (VisibleUniverse.kt): the stroke width is 1f / zoom in the local
-        // system; after scale(textureScale) this yields exactly 1 pixel on screen.
         let width = 1.0 / zoom;
 
         let to_world = |p: (f32, f32)| -> Vec2 {
@@ -1190,8 +1184,6 @@ impl Renderer {
             center + q.rotate(rot)
         };
 
-        // A texture can consist of thousands of segments; everything outside the frame
-        // is culled by the clip circle of the planet's radius anyway.
         let view = self.view;
         for sub in tex {
             for w in sub.windows(2) {
@@ -1258,7 +1250,6 @@ impl Renderer {
                 }
             }
             sim::SparkStyle::DotAbsolute => {
-                // Canon: center is pos / zoom (VisibleUniverse.kt:drawSpark, DOT_ABSOLUTE).
                 let c = pos * (1.0 / zoom);
                 if view.point_visible(c, s.size) {
                     push_circle_fill(&mut self.instances, c, s.size, s.color, 1.0);
@@ -1293,8 +1284,6 @@ impl Renderer {
         let view = self.view;
         let color = c4(assets::TRACK);
         let w = 1.0 / zoom;
-        // drawPoints(PointMode.Lines) draws each pair independently, so segments can be
-        // discarded one by one (with a 10 % margin) without "breaking" the neighbours.
         for i in 0..n - 1 {
             if !view.seg_visible(pos[i], pos[i + 1], w) {
                 continue;
@@ -1323,13 +1312,17 @@ impl Renderer {
         let color = with_alpha(blue, 0.5);
         let view = self.view;
 
-        if view.circle_visible(target.body.pos, target.body.radius + ap.braking_distance) {
-            let poly = polygon_points(target.body.radius + ap.braking_distance, 15);
+        let brake_r = target.body.radius + ap.braking_distance;
+        if view.circle_visible(target.body.pos, brake_r) {
             let rot = now * PI2f / 10.0;
-            let pts: Vec<Vec2> = poly.iter().map(|p| target.body.pos + p.rotate(rot)).collect();
+            self.scratch_pts.clear();
+            for &unit in &self.unit_poly_15 {
+                self.scratch_pts
+                    .push(target.body.pos + (unit * brake_r).rotate(rot));
+            }
             push_polyline(
                 &mut self.instances,
-                &pts,
+                &self.scratch_pts,
                 true,
                 1.0 / zoom,
                 color,
@@ -1403,7 +1396,12 @@ impl Renderer {
             Vec2::new(height * 0.875, height * 0.25),
             Vec2::new(height * 0.75, 0.0),
         ];
-        let pts: Vec<Vec2> = local.iter().map(|p| v + p.rotate(landing.angle)).collect();
+        let pts = [
+            v + local[0].rotate(landing.angle),
+            v + local[1].rotate(landing.angle),
+            v + local[2].rotate(landing.angle),
+            v + local[3].rotate(landing.angle),
+        ];
         push_polyline(
             &mut self.instances,
             &pts,
@@ -1416,8 +1414,6 @@ impl Renderer {
         );
     }
 
-    /// Draws the ship and returns the instance index up to which the "pre-fill layer"
-    /// (the legs) extends — the silhouette fill is drawn between `[0, split)` and `[split, len)`.
     fn emit_ship(&mut self, u: &Simulator, zoom: f32) -> usize {
         let ship = &u.ship;
         let pos = ship.body.pos;
@@ -1432,10 +1428,13 @@ impl Renderer {
 
         if ship.landing.is_some() {
             for sub in assets::SPACESHIP_LEGS {
-                let pts: Vec<Vec2> = sub.iter().map(|&p| transform(p)).collect();
+                self.scratch_pts.clear();
+                for &p in sub.iter() {
+                    self.scratch_pts.push(transform(p));
+                }
                 push_polyline(
                     &mut self.instances,
-                    &pts,
+                    &self.scratch_pts,
                     false,
                     2.0 / zoom,
                     [0xCC as f32 / 255.0, 0xCC as f32 / 255.0, 0xCC as f32 / 255.0, 1.0],
@@ -1448,7 +1447,7 @@ impl Renderer {
 
         let fill_split = self.instances.len();
 
-        // silhouette fill (gather the polygon's vertices in world coordinates)
+        // Ship silhouette fill vertices
         if let Some(sub) = assets::SPACESHIP_PATH.first() {
             let eg = c4(assets::EIGENGRAU);
             for &p in sub.iter() {
@@ -1460,17 +1459,20 @@ impl Renderer {
             }
         }
 
-        // silhouette outline (white; black while transiting in front of the star)
+        // Ship outline (white in space, black while transiting across the star disk)
         let outline = if ship.transit {
             [0.0, 0.0, 0.0, 1.0]
         } else {
             [1.0, 1.0, 1.0, 1.0]
         };
         for sub in assets::SPACESHIP_PATH {
-            let pts: Vec<Vec2> = sub.iter().map(|&p| transform(p)).collect();
+            self.scratch_pts.clear();
+            for &p in sub.iter() {
+                self.scratch_pts.push(transform(p));
+            }
             push_polyline(
                 &mut self.instances,
-                &pts,
+                &self.scratch_pts,
                 true,
                 2.0 / zoom,
                 outline,
@@ -1482,10 +1484,13 @@ impl Renderer {
 
         if !ship.thrust.is_zero() {
             for sub in assets::THRUST_PATH {
-                let pts: Vec<Vec2> = sub.iter().map(|&p| transform(p)).collect();
+                self.scratch_pts.clear();
+                for &p in sub.iter() {
+                    self.scratch_pts.push(transform(p));
+                }
                 push_polyline(
                     &mut self.instances,
-                    &pts,
+                    &self.scratch_pts,
                     true,
                     2.0 / zoom,
                     [0xFF as f32 / 255.0, 0x88 as f32 / 255.0, 0.0, 1.0],
@@ -1500,7 +1505,6 @@ impl Renderer {
     }
 }
 
-/// sRGB value 0..1 -> wgpu::Color (written as-is, with no gamma conversion).
 fn bytes_to_wgpu_color(c: [f32; 4]) -> wgpu::Color {
     wgpu::Color {
         r: c[0] as f64,
